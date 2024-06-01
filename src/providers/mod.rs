@@ -1,42 +1,73 @@
 use {
-    self::zerion::ZerionProvider,
+    self::{coinbase::CoinbaseProvider, zerion::ZerionProvider},
     crate::{
         env::ProviderConfig,
-        error::RpcError,
-        handlers::{HistoryQueryParams, HistoryResponseBody},
+        error::{RpcError, RpcResult},
+        handlers::{
+            balance::{self, BalanceQueryParams, BalanceResponseBody},
+            convert::{
+                allowance::{AllowanceQueryParams, AllowanceResponseBody},
+                approve::{ConvertApproveQueryParams, ConvertApproveResponseBody},
+                gas_price::{GasPriceQueryParams, GasPriceQueryResponseBody},
+                quotes::{ConvertQuoteQueryParams, ConvertQuoteResponseBody},
+                tokens::{TokensListQueryParams, TokensListResponseBody},
+                transaction::{ConvertTransactionQueryParams, ConvertTransactionResponseBody},
+            },
+            fungible_price::{PriceCurrencies, PriceResponseBody},
+            history::{HistoryQueryParams, HistoryResponseBody},
+            onramp::{
+                options::{OnRampBuyOptionsParams, OnRampBuyOptionsResponse},
+                quotes::{OnRampBuyQuotesParams, OnRampBuyQuotesResponse},
+            },
+            portfolio::{PortfolioQueryParams, PortfolioResponseBody},
+            RpcQueryParams,
+        },
     },
+    async_trait::async_trait,
     axum::response::Response,
     axum_tungstenite::WebSocketUpgrade,
     hyper::http::HeaderValue,
     rand::{distributions::WeightedIndex, prelude::Distribution, rngs::OsRng},
-    std::{fmt::Debug, hash::Hash, sync::Arc},
+    serde::{Deserialize, Serialize},
+    std::{
+        collections::{HashMap, HashSet},
+        fmt::{Debug, Display},
+        hash::Hash,
+        sync::Arc,
+    },
     tracing::{info, log::warn},
     wc::metrics::TaskMetrics,
 };
 
+mod aurora;
 mod base;
 mod binance;
+mod coinbase;
+mod getblock;
 mod infura;
-mod omnia;
+mod mantle;
+mod near;
+mod one_inch;
 mod pokt;
 mod publicnode;
+mod quicknode;
 mod weights;
-mod zerion;
+pub mod zerion;
 mod zksync;
 mod zora;
 
-use {
-    crate::{error::RpcResult, handlers::RpcQueryParams},
-    async_trait::async_trait,
-    std::{collections::HashMap, fmt::Display},
-};
 pub use {
+    aurora::AuroraProvider,
     base::BaseProvider,
     binance::BinanceProvider,
+    getblock::GetBlockProvider,
     infura::{InfuraProvider, InfuraWsProvider},
-    omnia::OmniatechProvider,
+    mantle::MantleProvider,
+    near::NearProvider,
+    one_inch::OneInchProvider,
     pokt::PoktProvider,
     publicnode::PublicnodeProvider,
+    quicknode::QuicknodeProvider,
     zksync::ZKSyncProvider,
     zora::{ZoraProvider, ZoraWsProvider},
 };
@@ -45,7 +76,32 @@ static WS_PROXY_TASK_METRICS: TaskMetrics = TaskMetrics::new("ws_proxy_task");
 
 pub type WeightResolver = HashMap<String, HashMap<ProviderKind, Weight>>;
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct ProvidersConfig {
+    pub prometheus_query_url: Option<String>,
+    pub prometheus_workspace_header: Option<String>,
+
+    pub infura_project_id: String,
+    pub pokt_project_id: String,
+    pub quicknode_api_token: String,
+
+    pub zerion_api_key: Option<String>,
+    pub coinbase_api_key: Option<String>,
+    pub coinbase_app_id: Option<String>,
+    pub one_inch_api_key: Option<String>,
+    /// GetBlock provider access tokens in JSON format
+    pub getblock_access_tokens: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SupportedChains {
+    pub http: HashSet<String>,
+    pub ws: HashSet<String>,
+}
+
 pub struct ProviderRepository {
+    pub supported_chains: SupportedChains,
+
     providers: HashMap<ProviderKind, Arc<dyn RpcProvider>>,
     ws_providers: HashMap<ProviderKind, Arc<dyn RpcWsProvider>>,
 
@@ -56,30 +112,78 @@ pub struct ProviderRepository {
     prometheus_workspace_header: String,
 
     pub history_provider: Arc<dyn HistoryProvider>,
+    pub portfolio_provider: Arc<dyn PortfolioProvider>,
+    pub coinbase_pay_provider: Arc<dyn HistoryProvider>,
+    pub onramp_provider: Arc<dyn OnRampProvider>,
+    pub balance_provider: Arc<dyn BalanceProvider>,
+    pub conversion_provider: Arc<dyn ConversionProvider>,
+    pub fungible_price_provider: Arc<dyn FungiblePriceProvider>,
 }
 
 impl ProviderRepository {
     #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
+    pub fn new(config: &ProvidersConfig) -> Self {
         let prometheus_client = {
-            let prometheus_query_url =
-                std::env::var("SIG_PROXY_URL").unwrap_or("http://localhost:8080/".into());
+            let prometheus_query_url = config
+                .prometheus_query_url
+                .clone()
+                .unwrap_or("http://localhost:8080/".into());
 
             prometheus_http_query::Client::try_from(prometheus_query_url)
                 .expect("Failed to connect to prometheus")
         };
 
-        let prometheus_workspace_header =
-            std::env::var("SIG_PROM_WORKSPACE_HEADER").unwrap_or("localhost:9090".into());
+        let prometheus_workspace_header = config
+            .prometheus_workspace_header
+            .clone()
+            .unwrap_or("localhost:9090".into());
 
         // Don't crash the application if the ZERION_API_KEY is not set
         // TODO: find a better way to handle this
-        let zerion_api_key =
-            std::env::var("RPC_PROXY_ZERION_API_KEY").unwrap_or("ZERION_KEY_UNDEFINED".into());
+        let zerion_api_key = config
+            .zerion_api_key
+            .clone()
+            .unwrap_or("ZERION_KEY_UNDEFINED".into());
 
-        let history_provider = Arc::new(ZerionProvider::new(zerion_api_key));
+        // Don't crash the application if the COINBASE_API_KEY_UNDEFINED is not set
+        // TODO: find a better way to handle this
+        let coinbase_api_key = config
+            .coinbase_api_key
+            .clone()
+            .unwrap_or("COINBASE_API_KEY_UNDEFINED".into());
+
+        // Don't crash the application if the COINBASE_APP_ID_UNDEFINED is not set
+        // TODO: find a better way to handle this
+        let coinbase_app_id = config
+            .coinbase_app_id
+            .clone()
+            .unwrap_or("COINBASE_APP_ID_UNDEFINED".into());
+
+        // Don't crash the application if the ONE_INCH_API_KEY is not set
+        // TODO: find a better way to handle this
+        let one_inch_api_key = config
+            .one_inch_api_key
+            .clone()
+            .unwrap_or("ONE_INCH_API_KEY".into());
+
+        let zerion_provider = Arc::new(ZerionProvider::new(zerion_api_key));
+        let history_provider = zerion_provider.clone();
+        let portfolio_provider = zerion_provider.clone();
+        let balance_provider = zerion_provider.clone();
+        let fungible_price_provider = zerion_provider;
+        let conversion_provider = Arc::new(OneInchProvider::new(one_inch_api_key));
+
+        let coinbase_pay_provider = Arc::new(CoinbaseProvider::new(
+            coinbase_api_key,
+            coinbase_app_id,
+            "https://pay.coinbase.com/api/v1".into(),
+        ));
 
         Self {
+            supported_chains: SupportedChains {
+                http: HashSet::new(),
+                ws: HashSet::new(),
+            },
             providers: HashMap::new(),
             ws_providers: HashMap::new(),
             weight_resolver: HashMap::new(),
@@ -87,39 +191,80 @@ impl ProviderRepository {
             prometheus_client,
             prometheus_workspace_header,
             history_provider,
+            portfolio_provider,
+            coinbase_pay_provider: coinbase_pay_provider.clone(),
+            onramp_provider: coinbase_pay_provider,
+            balance_provider,
+            conversion_provider,
+            fungible_price_provider,
         }
     }
 
-    pub fn get_provider_for_chain_id(&self, chain_id: &str) -> Option<Arc<dyn RpcProvider>> {
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub fn get_provider_for_chain_id(
+        &self,
+        chain_id: &str,
+        max_providers: usize,
+    ) -> Result<Vec<Arc<dyn RpcProvider>>, RpcError> {
         let Some(providers) = self.weight_resolver.get(chain_id) else {
-            return None;
+            return Err(RpcError::UnsupportedChain(chain_id.to_string()));
         };
 
         if providers.is_empty() {
-            return None;
+            return Err(RpcError::UnsupportedChain(chain_id.to_string()));
         }
 
         let weights: Vec<_> = providers.iter().map(|(_, weight)| weight.value()).collect();
+        let non_zero_weight_providers = weights.iter().filter(|&x| *x > 0).count();
         let keys = providers.keys().cloned().collect::<Vec<_>>();
-        match WeightedIndex::new(weights) {
-            Ok(dist) => {
-                let random = dist.sample(&mut OsRng);
-                let provider = keys.get(random).unwrap();
 
-                self.providers.get(provider).cloned()
+        match WeightedIndex::new(weights) {
+            Ok(mut dist) => {
+                let providers_to_iterate = std::cmp::min(max_providers, non_zero_weight_providers);
+                let providers_result = (0..providers_to_iterate)
+                    .map(|i| {
+                        let dist_key = dist.sample(&mut OsRng);
+                        let provider = keys.get(dist_key).ok_or_else(|| {
+                            RpcError::WeightedProvidersIndex(format!(
+                                "Failed to get random provider for chain_id: {}",
+                                chain_id
+                            ))
+                        })?;
+
+                        // Update the weight of the provider to 0 to remove it from the next
+                        // sampling, as updating weights returns an error if
+                        // all weights are zero
+                        if i < providers_to_iterate - 1 {
+                            if let Err(e) = dist.update_weights(&[(dist_key, &0)]) {
+                                return Err(RpcError::WeightedProvidersIndex(format!(
+                                    "Failed to update weight in sampling iteration: {}",
+                                    e
+                                )));
+                            }
+                        };
+
+                        self.providers.get(provider).cloned().ok_or_else(|| {
+                            RpcError::WeightedProvidersIndex(format!(
+                                "Provider not found during the weighted index check: {}",
+                                provider
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(providers_result)
             }
             Err(e) => {
+                // Respond with temporarily unavailable when all weights are 0 for
+                // a chain providers
                 warn!("Failed to create weighted index: {}", e);
-                None
+                Err(RpcError::ChainTemporarilyUnavailable(chain_id.to_string()))
             }
         }
     }
 
+    #[tracing::instrument(skip(self), level = "debug")]
     pub fn get_ws_provider_for_chain_id(&self, chain_id: &str) -> Option<Arc<dyn RpcWsProvider>> {
-        let Some(providers) = self.ws_weight_resolver.get(chain_id) else {
-            return None;
-        };
-
+        let providers = self.ws_weight_resolver.get(chain_id)?;
         if providers.is_empty() {
             return None;
         }
@@ -129,7 +274,9 @@ impl ProviderRepository {
         match WeightedIndex::new(weights) {
             Ok(dist) => {
                 let random = dist.sample(&mut OsRng);
-                let provider = keys.get(random).unwrap();
+                let provider = keys
+                    .get(random)
+                    .expect("Failed to get random provider: out of index");
 
                 self.ws_providers.get(provider).cloned()
             }
@@ -159,6 +306,7 @@ impl ProviderRepository {
         supported_ws_chains
             .into_iter()
             .for_each(|(chain_id, (_, weight))| {
+                self.supported_chains.ws.insert(chain_id.clone());
                 self.ws_weight_resolver
                     .entry(chain_id)
                     .or_default()
@@ -182,6 +330,7 @@ impl ProviderRepository {
         supported_chains
             .into_iter()
             .for_each(|(chain_id, (_, weight))| {
+                self.supported_chains.http.insert(chain_id.clone());
                 self.weight_resolver
                     .entry(chain_id)
                     .or_default()
@@ -190,6 +339,7 @@ impl ProviderRepository {
         info!("Added provider: {}", provider_kind);
     }
 
+    #[tracing::instrument(skip_all)]
     pub async fn update_weights(&self, metrics: &crate::Metrics) {
         info!("Updating weights");
 
@@ -218,46 +368,72 @@ impl ProviderRepository {
             }
         }
     }
+
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub fn get_provider_by_provider_id(&self, provider_id: &str) -> Option<Arc<dyn RpcProvider>> {
+        let provider = ProviderKind::from_str(provider_id)?;
+
+        self.providers.get(&provider).cloned()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderKind {
+    Aurora,
     Infura,
     Pokt,
     Binance,
     ZKSync,
     Publicnode,
-    Omniatech,
     Base,
     Zora,
+    Zerion,
+    Coinbase,
+    Quicknode,
+    Near,
+    Mantle,
+    GetBlock,
 }
 
 impl Display for ProviderKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", match self {
+            ProviderKind::Aurora => "Aurora",
             ProviderKind::Infura => "Infura",
             ProviderKind::Pokt => "Pokt",
             ProviderKind::Binance => "Binance",
             ProviderKind::ZKSync => "zkSync",
             ProviderKind::Publicnode => "Publicnode",
-            ProviderKind::Omniatech => "Omniatech",
             ProviderKind::Base => "Base",
             ProviderKind::Zora => "Zora",
+            ProviderKind::Zerion => "Zerion",
+            ProviderKind::Coinbase => "Coinbase",
+            ProviderKind::Quicknode => "Quicknode",
+            ProviderKind::Near => "Near",
+            ProviderKind::Mantle => "Mantle",
+            ProviderKind::GetBlock => "GetBlock",
         })
     }
 }
 
+#[allow(clippy::should_implement_trait)]
 impl ProviderKind {
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
+            "Aurora" => Some(Self::Aurora),
             "Infura" => Some(Self::Infura),
             "Pokt" => Some(Self::Pokt),
             "Binance" => Some(Self::Binance),
             "zkSync" => Some(Self::ZKSync),
             "Publicnode" => Some(Self::Publicnode),
-            "Omniatech" => Some(Self::Omniatech),
             "Base" => Some(Self::Base),
             "Zora" => Some(Self::Zora),
+            "Zerion" => Some(Self::Zerion),
+            "Coinbase" => Some(Self::Coinbase),
+            "Quicknode" => Some(Self::Quicknode),
+            "Near" => Some(Self::Near),
+            "Mantle" => Some(Self::Mantle),
+            "GetBlock" => Some(Self::GetBlock),
             _ => None,
         }
     }
@@ -283,6 +459,7 @@ pub trait RpcWsProvider: Provider {
 
 const MAX_PRIORITY: u64 = 100;
 
+#[derive(Debug, Clone, Copy)]
 pub enum Priority {
     Max,
     High,
@@ -382,7 +559,84 @@ pub trait HistoryProvider: Send + Sync + Debug {
     async fn get_transactions(
         &self,
         address: String,
-        body: hyper::body::Bytes,
         params: HistoryQueryParams,
+        http_client: reqwest::Client,
     ) -> RpcResult<HistoryResponseBody>;
+}
+
+#[async_trait]
+pub trait PortfolioProvider: Send + Sync + Debug {
+    async fn get_portfolio(
+        &self,
+        address: String,
+        body: hyper::body::Bytes,
+        params: PortfolioQueryParams,
+    ) -> RpcResult<PortfolioResponseBody>;
+}
+
+#[async_trait]
+pub trait OnRampProvider: Send + Sync + Debug {
+    async fn get_buy_options(
+        &self,
+        params: OnRampBuyOptionsParams,
+        http_client: reqwest::Client,
+    ) -> RpcResult<OnRampBuyOptionsResponse>;
+
+    async fn get_buy_quotes(
+        &self,
+        params: OnRampBuyQuotesParams,
+        http_client: reqwest::Client,
+    ) -> RpcResult<OnRampBuyQuotesResponse>;
+}
+
+#[async_trait]
+pub trait BalanceProvider: Send + Sync + Debug {
+    async fn get_balance(
+        &self,
+        address: String,
+        params: BalanceQueryParams,
+        http_client: reqwest::Client,
+    ) -> RpcResult<BalanceResponseBody>;
+}
+
+#[async_trait]
+pub trait FungiblePriceProvider: Send + Sync + Debug {
+    async fn get_price(
+        &self,
+        chain_id: &str,
+        address: &str,
+        currency: &PriceCurrencies,
+        http_client: reqwest::Client,
+    ) -> RpcResult<PriceResponseBody>;
+}
+
+#[async_trait]
+pub trait ConversionProvider: Send + Sync + Debug {
+    async fn get_tokens_list(
+        &self,
+        params: TokensListQueryParams,
+    ) -> RpcResult<TokensListResponseBody>;
+
+    async fn get_convert_quote(
+        &self,
+        params: ConvertQuoteQueryParams,
+    ) -> RpcResult<ConvertQuoteResponseBody>;
+
+    async fn build_approve_tx(
+        &self,
+        params: ConvertApproveQueryParams,
+    ) -> RpcResult<ConvertApproveResponseBody>;
+
+    async fn build_convert_tx(
+        &self,
+        params: ConvertTransactionQueryParams,
+    ) -> RpcResult<ConvertTransactionResponseBody>;
+
+    async fn get_gas_price(
+        &self,
+        params: GasPriceQueryParams,
+    ) -> RpcResult<GasPriceQueryResponseBody>;
+
+    async fn get_allowance(&self, params: AllowanceQueryParams)
+        -> RpcResult<AllowanceResponseBody>;
 }
