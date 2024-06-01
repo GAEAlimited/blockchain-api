@@ -40,13 +40,18 @@ fn default_supported_chains() -> HashMap<String, (String, Weight)> {
             "eip155:1".into(),
             ("ethereum".into(), Weight::new(Priority::High).unwrap()),
         ),
-        // Ethereum goerli
+        // Ethereum Holesky
         (
-            "eip155:5".into(),
+            "eip155:17000".into(),
             (
-                "ethereum-goerli".into(),
+                "ethereum-holesky-rpc".into(),
                 Weight::new(Priority::High).unwrap(),
             ),
+        ),
+        // Base mainnet
+        (
+            "eip155:8453".into(),
+            ("base".into(), Weight::new(Priority::Normal).unwrap()),
         ),
         // Binance Smart Chain mainnet
         (
@@ -79,13 +84,10 @@ fn default_supported_chains() -> HashMap<String, (String, Weight)> {
             "eip155:137".into(),
             ("polygon-bor".into(), Weight::new(Priority::Normal).unwrap()),
         ),
-        // Polygon bor testnet
+        // Mantle mainnet
         (
-            "eip155:80001".into(),
-            (
-                "polygon-mumbai-bor".into(),
-                Weight::new(Priority::High).unwrap(),
-            ),
+            "eip155:5000".into(),
+            ("mantle-rpc".into(), Weight::new(Priority::High).unwrap()),
         ),
     ])
 }
