@@ -1,0 +1,93 @@
+name: ⚙️ Deploy
+run-name: "Deploy: ${{ github.sha }} ➠ ${{ inputs.version-type }}:${{ inputs.version-tag }}${{ (!inputs.deploy-infra && !inputs.deploy-app) && ' 👀 deploy nothing' || ''}}${{ inputs.deploy-infra && ' ❱❱  infra' || '' }}${{ inputs.deploy-app && ' ❱❱  app' || '' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy-infra:
+        description: "Deploy Infra"
+        default: true
+        required: true
+        type: boolean
+      deploy-app:
+        description: "Deploy App"
+        default: true
+        required: true
+        type: boolean
+      stage:
+        description: 'Target Environment'
+        type: choice
+        options:
+          - staging
+          - prod
+        default: staging
+        required: true
+      version-type:
+        description: "Release Version"
+        type: choice
+        options:
+          - latest
+          - current
+          - manual
+        default: 'latest'
+        required: true
+      version-tag:
+        description: "Release Version Tag (for manual version)"
+        type: string
+        default: ''
+
+concurrency: deploy
+
+permissions:
+  contents: write
+  checks: write
+  id-token: write
+  packages: write
+
+jobs:
+  get_deployed_version:
+    name: Lookup deployed version
+    if: ${{ inputs.version-type == 'current' }}
+    secrets: inherit
+    uses: WalletConnect/ci_workflows/.github/workflows/release-get_deployed_version.yml@0.2.8
+    with:
+      task-name-stage: prod
+      task-name: ${{ vars.TASK_NAME }}
+      aws-region: ${{ vars.AWS_REGION }}
+      aws-role-arn: ${{vars.AWS_ROLE_PROD}}
+
+  select_version:
+    name: Select Version
+    needs: [ get_deployed_version ]
+    if: ${{ always() && !cancelled() && !failure() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Select target version
+        id: select_version
+        run: |
+          if [ "${{ inputs.version-type }}" == "current" ]; then
+            echo "version=${{ needs.get_deployed_version.outputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ inputs.version-type }}" == "latest" ]; then
+            echo "version=$(git tag | sort --version-sort | tail -n1)" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ inputs.version-tag }}" >> "$GITHUB_OUTPUT"
+          fi
+    outputs:
+      version: ${{ steps.select_version.outputs.version }}
+
+  cd:
+    name: CD
+    uses: ./.github/workflows/sub-cd.yml
+    needs: [ select_version ]
+    if: ${{ always() && !cancelled() && !failure() }}
+    secrets: inherit
+    with:
+      deploy-infra: ${{ inputs.deploy-infra }}
+      deploy-app: ${{ inputs.deploy-app }}
+      deploy-prod: ${{ inputs.stage == 'prod' }}
+      version: ${{ needs.select_version.outputs.version }}

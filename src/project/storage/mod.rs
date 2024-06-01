@@ -2,7 +2,7 @@ pub use config::*;
 use {
     crate::{
         project::{error::ProjectDataError, metrics::ProjectDataMetrics},
-        storage::{KeyValueStorage, StorageResult},
+        storage::{error::StorageError, KeyValueStorage, StorageResult},
     },
     cerberus::project::ProjectData,
     std::{
@@ -10,7 +10,7 @@ use {
         time::{Duration, Instant},
     },
     tap::TapFallible,
-    tracing::warn,
+    tracing::{error, warn},
 };
 
 mod config;
@@ -42,11 +42,17 @@ impl ProjectStorage {
 
         let cache_key = build_cache_key(id);
 
-        let data = self
-            .cache
-            .get(&cache_key)
-            .await
-            .tap_err(|err| warn!(?err, "error fetching data from project data cache"))?;
+        let data = match self.cache.get(&cache_key).await {
+            Ok(data) => data,
+            Err(StorageError::Deserialize) => {
+                warn!("failed to deserialize cached ProjectData");
+                None
+            }
+            Err(err) => {
+                warn!(?err, "error fetching data from project data cache");
+                return Err(err);
+            }
+        };
 
         self.metrics.fetch_cache_time(time.elapsed());
 
@@ -56,7 +62,13 @@ impl ProjectStorage {
     pub async fn set(&self, id: &str, data: &ProjectDataResult) {
         let cache_key = build_cache_key(id);
 
-        let serialized = crate::storage::serialize(&data).unwrap(); //?;
+        let serialized = match crate::storage::serialize(&data) {
+            Ok(serialized) => serialized,
+            Err(err) => {
+                error!(?err, "failed to serialize cached project data");
+                return;
+            }
+        };
         let cache = self.cache.clone();
         let cache_ttl = self.cache_ttl;
 
