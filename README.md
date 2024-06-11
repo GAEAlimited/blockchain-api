@@ -1,4 +1,4 @@
-# Blockchain API
+# GCS20 $uperChain Blockchain API
 
 [📚 Documentation](https://docs.walletconnect.com/cloud/blockchain-api)
 
